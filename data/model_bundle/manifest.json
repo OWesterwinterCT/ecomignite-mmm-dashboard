@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "kind": "real",
+  "model_name": "Ecomignite Orders MMM",
+  "target_column": "eligible_orders",
+  "target_label": "Orders",
+  "date_column": "date",
+  "granularity": "weekly",
+  "week_starts": "Monday",
+  "currency": "",
+  "channels": [
+    "meta_conversion_spend",
+    "meta_engagement_spend",
+    "meta_traffic_spend",
+    "meta_thruplay_spend",
+    "meta_other_spend",
+    "google_search_spend",
+    "google_pmax_spend",
+    "google_display_spend"
+  ],
+  "channel_labels": {
+    "meta_conversion_spend": "Meta Conversion",
+    "meta_engagement_spend": "Meta Engagement",
+    "meta_traffic_spend": "Meta Traffic",
+    "meta_thruplay_spend": "Meta ThruPlay",
+    "meta_other_spend": "Meta Other",
+    "google_search_spend": "Google Search",
+    "google_pmax_spend": "Google Performance Max",
+    "google_display_spend": "Google Display"
+  },
+  "controls": [
+    "discount_rate_scaled",
+    "linear_trend_scaled"
+  ],
+  "control_labels": {
+    "discount_rate_scaled": "Discounts",
+    "linear_trend_scaled": "Trend"
+  },
+  "adstock_l_max": 8,
+  "adstock_normalize": true,
+  "adstock_first": true,
+  "saturation": "Hill",
+  "yearly_seasonality": 2,
+  "fourier_names": [
+    "sin_1",
+    "sin_2",
+    "cos_1",
+    "cos_2"
+  ],
+  "control_scaling": {
+    "discount_unit": 0.1,
+    "trend_origin": "2023-10-02",
+    "trend_span_days": 1078.0
+  },
+  "control_scaling_available": true,
+  "fit_interval_level": 0.9,
+  "fit_intervals_type": "expected_mean",
+  "training_start": "2023-10-02",
+  "training_end": "2026-09-14",
+  "posterior_draws_available": 4000,
+  "posterior_draws_exported": 2000,
+  "diagnostics": {
+    "divergences": 0,
+    "max_rhat": 1.0030586128672128,
+    "min_bulk_ess": 1735.0129216634239,
+    "min_tail_ess": 1260.806205850388,
+    "min_bfmi": 0.8761941237077833
+  },
+  "oos": {
+    "status": "available",
+    "source": "supplied_holdout_table",
+    "training_end": "2026-06-22",
+    "intervals_type": "posterior_predictive",
+    "weeks": 12,
+    "start": "2026-06-29",
+    "end": "2026-09-14"
+  },
+  "validation": {
+    "weekly_fields": [
+      "gross_revenue",
+      "discount_amount",
+      "refund_amount",
+      "meta_imputed_spend",
+      "google_imputed_spend",
+      "days",
+      "meta_imputed_days",
+      "google_imputed_days",
+      "google_backfilled_days",
+      "discount_rate",
+      "refund_rate",
+      "meta_imputed_share",
+      "google_imputed_share",
+      "any_imputation",
+      "high_imputation_week"
+    ],
+    "daily_available": true,
+    "note": "Missing observations remain missing; absent quality flags do not imply complete data."
+  }
+}
