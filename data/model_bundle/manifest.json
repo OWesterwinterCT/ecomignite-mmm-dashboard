@@ -2,6 +2,8 @@
   "schema_version": 1,
   "kind": "real",
   "model_name": "Ecomignite Orders MMM",
+  "exporter_version": "2026.10.24",
+  "spend_scope": "modeled_channels_only",
   "target_column": "eligible_orders",
   "target_label": "Orders",
   "date_column": "date",
@@ -12,21 +14,26 @@
     "meta_conversion_spend",
     "meta_engagement_spend",
     "meta_traffic_spend",
-    "meta_thruplay_spend",
-    "meta_other_spend",
     "google_search_spend",
     "google_pmax_spend",
-    "google_display_spend"
+    "google_display_spend",
+    "google_video_spend",
+    "google_shopping_spend",
+    "google_demand_gen_spend"
   ],
   "channel_labels": {
     "meta_conversion_spend": "Meta Conversion",
     "meta_engagement_spend": "Meta Engagement",
     "meta_traffic_spend": "Meta Traffic",
-    "meta_thruplay_spend": "Meta ThruPlay",
-    "meta_other_spend": "Meta Other",
     "google_search_spend": "Google Search",
     "google_pmax_spend": "Google Performance Max",
-    "google_display_spend": "Google Display"
+    "google_display_spend": "Google Display",
+    "google_video_spend": "Google Video",
+    "google_shopping_spend": "Google Shopping",
+    "google_demand_gen_spend": "Google Demand Gen"
+  },
+  "channel_notes": {
+    "google_video_spend": "Google Video can include YouTube and video partners; other Google campaign types may also deliver on YouTube."
   },
   "controls": [
     "discount_rate_scaled",
@@ -57,14 +64,14 @@
   "fit_intervals_type": "expected_mean",
   "training_start": "2023-10-02",
   "training_end": "2026-09-14",
-  "posterior_draws_available": 4000,
+  "posterior_draws_available": 2000,
   "posterior_draws_exported": 2000,
   "diagnostics": {
     "divergences": 0,
-    "max_rhat": 1.0030586128672128,
-    "min_bulk_ess": 1735.0129216634239,
-    "min_tail_ess": 1260.806205850388,
-    "min_bfmi": 0.8761941237077833
+    "max_rhat": 1.0059109986706578,
+    "min_bulk_ess": 1048.4696638422888,
+    "min_tail_ess": 766.3952798222809,
+    "min_bfmi": 0.8453548636489642
   },
   "oos": {
     "status": "available",
@@ -73,7 +80,87 @@
     "intervals_type": "posterior_predictive",
     "weeks": 12,
     "start": "2026-06-29",
-    "end": "2026-09-14"
+    "end": "2026-09-14",
+    "evaluation_type": "conditional_on_realized_media_and_discounts",
+    "metrics": [
+      {
+        "model": "Bayesian MMM",
+        "R\u00b2": 0.2084772321,
+        "Correlation": 0.571512074,
+        "RMSE": 52.168813263,
+        "MAE": 43.5280796391,
+        "MAPE (%)": 13.4717994816,
+        "WAPE (%)": 13.8845549088,
+        "Bias (actual \u2212 predicted)": 18.9191691596
+      },
+      {
+        "model": "Last training week",
+        "R\u00b2": -1.7468069121,
+        "Correlation": null,
+        "RMSE": 97.1836748979,
+        "MAE": 81.6666666667,
+        "MAPE (%)": 23.9465408619,
+        "WAPE (%)": 26.0499734184,
+        "Bias (actual \u2212 predicted)": 77.5
+      },
+      {
+        "model": "Same week last year",
+        "R\u00b2": 0.2551804367,
+        "Correlation": 0.5561923749,
+        "RMSE": 50.6063237155,
+        "MAE": 37.5,
+        "MAPE (%)": 12.3559632854,
+        "WAPE (%)": 11.961722488,
+        "Bias (actual \u2212 predicted)": -10.6666666667
+      }
+    ],
+    "input_quality": [
+      {
+        "channel": "meta_conversion_spend",
+        "training_missing_days": 0,
+        "holdout_missing_days": 0
+      },
+      {
+        "channel": "meta_engagement_spend",
+        "training_missing_days": 0,
+        "holdout_missing_days": 0
+      },
+      {
+        "channel": "meta_traffic_spend",
+        "training_missing_days": 0,
+        "holdout_missing_days": 0
+      },
+      {
+        "channel": "google_search_spend",
+        "training_missing_days": 86,
+        "holdout_missing_days": 0
+      },
+      {
+        "channel": "google_pmax_spend",
+        "training_missing_days": 86,
+        "holdout_missing_days": 0
+      },
+      {
+        "channel": "google_display_spend",
+        "training_missing_days": 86,
+        "holdout_missing_days": 0
+      },
+      {
+        "channel": "google_video_spend",
+        "training_missing_days": 86,
+        "holdout_missing_days": 0
+      },
+      {
+        "channel": "google_shopping_spend",
+        "training_missing_days": 86,
+        "holdout_missing_days": 0
+      },
+      {
+        "channel": "google_demand_gen_spend",
+        "training_missing_days": 86,
+        "holdout_missing_days": 0
+      }
+    ]
   },
   "validation": {
     "weekly_fields": [
@@ -82,14 +169,42 @@
       "refund_amount",
       "meta_imputed_spend",
       "google_imputed_spend",
+      "meta_conversion_spend_imputed_spend",
+      "meta_engagement_spend_imputed_spend",
+      "meta_traffic_spend_imputed_spend",
+      "google_search_spend_imputed_spend",
+      "google_pmax_spend_imputed_spend",
+      "google_display_spend_imputed_spend",
+      "google_video_spend_imputed_spend",
+      "google_shopping_spend_imputed_spend",
+      "google_demand_gen_spend_imputed_spend",
       "days",
       "meta_imputed_days",
+      "meta_backfilled_days",
       "google_imputed_days",
       "google_backfilled_days",
+      "meta_conversion_spend_imputed_days",
+      "meta_engagement_spend_imputed_days",
+      "meta_traffic_spend_imputed_days",
+      "google_search_spend_imputed_days",
+      "google_pmax_spend_imputed_days",
+      "google_display_spend_imputed_days",
+      "google_video_spend_imputed_days",
+      "google_shopping_spend_imputed_days",
+      "google_demand_gen_spend_imputed_days",
       "discount_rate",
       "refund_rate",
       "meta_imputed_share",
       "google_imputed_share",
+      "meta_conversion_spend_imputed_share",
+      "meta_engagement_spend_imputed_share",
+      "meta_traffic_spend_imputed_share",
+      "google_search_spend_imputed_share",
+      "google_pmax_spend_imputed_share",
+      "google_display_spend_imputed_share",
+      "google_video_spend_imputed_share",
+      "google_shopping_spend_imputed_share",
+      "google_demand_gen_spend_imputed_share",
       "any_imputation",
       "high_imputation_week"
     ],

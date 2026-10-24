@@ -24,6 +24,21 @@ COLORS = [
     "#64748B", "#16A34A", "#F59E0B", "#EF4444",
     "#0D9488", "#6366F1", "#A855F7", "#D97706",
 ]
+DEFAULT_LABELS = {
+    "meta_spend": "Meta",
+    "meta_conversion_spend": "Meta Conversion",
+    "meta_engagement_spend": "Meta Engagement",
+    "meta_traffic_spend": "Meta Traffic",
+    "meta_thruplay_spend": "Meta ThruPlay",
+    "meta_other_spend": "Meta Other",
+    "google_search_spend": "Google Search",
+    "google_pmax_spend": "Google Performance Max",
+    "google_display_spend": "Google Display",
+    "google_video_spend": "Google Video",
+    "google_shopping_spend": "Google Shopping",
+    "google_demand_gen_spend": "Google Demand Gen",
+}
+
 GROUP_COLORS = {
     "Marketing": BLUE,
     "Context": TEAL,
@@ -37,7 +52,8 @@ def _get(bundle: Any, name: str) -> Any:
 
 
 def _labels(manifest: Mapping[str, Any]) -> dict[str, str]:
-    labels = dict(manifest.get("labels", {}))
+    labels = dict(DEFAULT_LABELS)
+    labels.update(manifest.get("labels", {}))
     labels.update(manifest.get("channel_labels", {}))
     labels.update(manifest.get("control_labels", {}))
     labels.update({
@@ -73,12 +89,12 @@ def _layout(
         paper_bgcolor="white",
         plot_bgcolor="white",
         height=height,
-        margin=dict(l=65, r=30, t=65, b=105 if legend else 60),
+        margin=dict(l=65, r=30, t=65, b=145 if legend else 70),
         hovermode="x unified",
         showlegend=legend,
         legend=dict(
             orientation="h", yanchor="top", y=-0.23,
-            xanchor="center", x=0.5, title_text="",
+            xanchor="center", x=0.5, title_text="", groupclick="togglegroup",
         ),
         xaxis=dict(title=x_title, gridcolor="#EEF2F7", zeroline=False),
         yaxis=dict(title=y_title, gridcolor="#EEF2F7", zeroline=False, tickformat=",.0f"),
@@ -143,7 +159,7 @@ def spend_timeline(
     for i, channel in enumerate(channels):
         fig.add_trace(go.Scatter(
             x=frame["date"], y=frame[channel], mode="lines",
-            name=labels.get(channel, channel), connectgaps=False,
+            name=labels.get(channel, DEFAULT_LABELS.get(channel, channel)), connectgaps=False,
             line=dict(color=COLORS[i % len(COLORS)], width=2),
             hovertemplate="%{x|%d %b %Y}<br>Spend: %{y:,.2f}<extra>%{fullData.name}</extra>",
         ))
@@ -159,7 +175,7 @@ def spend_stacked(
     fig = go.Figure()
     for i, channel in enumerate(channels):
         fig.add_bar(
-            x=frame["date"], y=frame[channel], name=labels.get(channel, channel),
+            x=frame["date"], y=frame[channel], name=labels.get(channel, DEFAULT_LABELS.get(channel, channel)),
             marker_color=COLORS[i % len(COLORS)],
             customdata=total.to_numpy()[:, None],
             hovertemplate=(
@@ -180,29 +196,42 @@ def spend_totals(
     if totals.isna().any():
         raise ValueError("At least one channel has no observed spending.")
     fig = go.Figure()
-    ordered_labels = [labels.get(channel, channel) for channel in totals.index]
+    ordered_labels = [labels.get(channel, DEFAULT_LABELS.get(channel, channel)) for channel in totals.index]
     for channel, value in totals.items():
         color = COLORS[list(channels).index(channel) % len(COLORS)]
         fig.add_bar(
-            x=[labels.get(channel, channel)], y=[value],
-            name=labels.get(channel, channel), marker_color=color,
+            x=[labels.get(channel, DEFAULT_LABELS.get(channel, channel))], y=[value],
+            name=labels.get(channel, DEFAULT_LABELS.get(channel, channel)), marker_color=color,
             text=[value], texttemplate="%{text:,.0f}", textposition="outside",
             hovertemplate="<b>%{x}</b><br>Total spend: %{y:,.2f}<extra></extra>",
         )
-    _layout(fig, "Total spend by channel", "Spend over the modeling period", height=500, x_title="")
+    _layout(fig, "Total spend by channel", "Spend over the selected period", height=500, x_title="")
     fig.update_layout(bargap=0.32)
     fig.update_xaxes(categoryorder="array", categoryarray=ordered_labels, tickangle=-22)
     fig.update_yaxes(rangemode="tozero")
     return fig
 
 
-def fit_chart(frame: pd.DataFrame, title: str) -> go.Figure:
+def fit_chart(
+    frame: pd.DataFrame, title: str, interval_kind: str = "expected_mean",
+    interval_level: float = 0.90,
+) -> go.Figure:
+    if not 0 < interval_level < 1:
+        raise ValueError("Interval level must be between zero and one.")
+    interval_names = {
+        "expected_mean": "expected-mean credible interval",
+        "posterior_predictive": "predictive interval",
+        "unavailable": "exported interval",
+    }
+    if interval_kind not in interval_names:
+        raise ValueError("Unrecognized fit interval kind.")
     data = _sorted(frame)
     fig = go.Figure()
     if {"lower", "upper"}.issubset(data.columns):
         available = data[["lower", "upper"]].notna().all(axis=1)
         if available.any():
-            _band(fig, data["date"], data["lower"], data["upper"], BLUE, "90% model interval")
+            _band(fig, data["date"], data["lower"], data["upper"], BLUE,
+                  f"{100 * interval_level:g}% {interval_names[interval_kind]}")
     fig.add_trace(go.Scatter(
         x=data["date"], y=data["predicted"], name="Predicted orders", mode="lines",
         line=dict(color=ORANGE, width=2.7),
@@ -257,7 +286,7 @@ def contribution_chart(
         )
     fig.add_hline(y=0, line_color="#CBD5E1", line_width=1)
     title = "Marketing contributions" if marketing_only else "All model components"
-    _layout(fig, title, "Total modeled orders over the fitting period", height=500, x_title="")
+    _layout(fig, title, "Total modeled orders over the selected period", height=500, x_title="")
     fig.update_xaxes(categoryorder="array", categoryarray=totals["label"].tolist(), tickangle=-28)
     fig.update_layout(bargap=0.28)
     return fig
@@ -269,6 +298,8 @@ def efficiency_table(bundle: Any) -> pd.DataFrame:
     weekly = _get(bundle, "weekly")
     contributions = _get(bundle, "contributions")
     nice = _labels(manifest)
+    if set(pd.to_datetime(weekly["date"])) != set(pd.to_datetime(contributions["date"])):
+        raise ValueError("Spending and contribution dates must cover the same period.")
     media = contributions.loc[contributions["group"].eq("Marketing")]
     orders = media.groupby("effect")["mean"].sum().reindex(channels)
     if orders.isna().any():
@@ -286,6 +317,9 @@ def efficiency_table(bundle: Any) -> pd.DataFrame:
         table["total_spend"], table["modeled_orders"],
         out=np.full(len(table), np.nan), where=table["modeled_orders"].to_numpy() > 0,
     )
+    table.loc[
+        table["total_spend"].gt(0) & table["modeled_orders"].eq(0), "modeled_cpa"
+    ] = np.inf
     table["orders_per_spend"] = np.divide(
         table["modeled_orders"], table["total_spend"],
         out=np.full(len(table), np.nan), where=table["total_spend"].to_numpy() > 0,
@@ -304,11 +338,18 @@ def efficiency_share_chart(table: pd.DataFrame) -> go.Figure:
             x=data["channel_label"], y=data[column], name=label, marker_color=color,
             hovertemplate="<b>%{x}</b><br>Share: %{y:.1f}%<extra>%{fullData.name}</extra>",
         )
-    peak = max(float(data[["spend_share_pct", "effect_share_pct"]].max().max()), 1)
+    share_values = data[["spend_share_pct", "effect_share_pct"]].to_numpy(dtype=float)
+    finite_shares = share_values[np.isfinite(share_values)]
+    peak = max(float(finite_shares.max()), 1.0) if finite_shares.size else 1.0
     for row in data.itertuples():
-        label = f"CPA {row.modeled_cpa:,.1f}" if np.isfinite(row.modeled_cpa) else "CPA n/a"
+        label = (f"CPA {row.modeled_cpa:,.1f}" if np.isfinite(row.modeled_cpa)
+                 else "CPA unbounded" if np.isposinf(row.modeled_cpa) else "CPA n/a")
+        row_shares = np.asarray([row.spend_share_pct, row.effect_share_pct], dtype=float)
+        row_shares = row_shares[np.isfinite(row_shares)]
+        if not row_shares.size:
+            continue
         fig.add_annotation(
-            x=row.channel_label, y=max(row.spend_share_pct, row.effect_share_pct) + peak * 0.055,
+            x=row.channel_label, y=row_shares.max() + peak * 0.055,
             text=label, showarrow=False, font=dict(size=11, color=NAVY),
         )
     _layout(fig, "Spend share vs modeled marketing-order share", "Share (%)", height=490, x_title="")
@@ -320,12 +361,16 @@ def efficiency_share_chart(table: pd.DataFrame) -> go.Figure:
 
 def cpa_chart(table: pd.DataFrame) -> go.Figure:
     data = table.sort_values("modeled_cpa", ascending=True, na_position="last").copy()
+    finite = np.isfinite(data["modeled_cpa"])
     fig = go.Figure(go.Bar(
-        x=data["channel_label"], y=data["modeled_cpa"], name="Modeled CPA",
-        marker_color=TEAL, text=data["modeled_cpa"], texttemplate="%{text:,.1f}", textposition="outside",
+        x=data["channel_label"], y=data["modeled_cpa"].where(finite), name="Modeled CPA",
+        marker_color=TEAL, text=data["modeled_cpa"].where(finite), texttemplate="%{text:,.1f}", textposition="outside",
         hovertemplate="<b>%{x}</b><br>Modeled CPA: %{y:,.2f}<extra></extra>",
     ))
-    _layout(fig, "Modeled cost per marketing-generated order", "Spend per modeled order", height=430, x_title="", legend=False)
+    for row in data.loc[~finite].itertuples():
+        fig.add_annotation(x=row.channel_label, y=0, text="Unbounded" if np.isposinf(row.modeled_cpa) else "n/a",
+                           showarrow=False, yshift=12)
+    _layout(fig, "Cost per modeled media order", "Spend per modeled order", height=460, x_title="")
     fig.update_xaxes(categoryorder="array", categoryarray=data["channel_label"].tolist(), tickangle=-25)
     fig.update_yaxes(rangemode="tozero", tickformat=",.1f")
     return fig
@@ -341,6 +386,10 @@ def _posterior(bundle: Any) -> tuple[dict[str, np.ndarray], np.ndarray, float]:
         raise ValueError("Posterior arrays must share paired (sample, channel) dimensions.")
     if any(not np.isfinite(v).all() for v in values.values()):
         raise ValueError("Posterior arrays contain non-finite values.")
+    if ((values["alpha"] < 0) | (values["alpha"] > 1)).any():
+        raise ValueError("Adstock alpha must lie in [0, 1].")
+    if any((values[name] <= 0).any() for name in ("beta", "kappa", "slope")):
+        raise ValueError("Hill parameters must be positive.")
     scale_source = posterior.get("channel_scale")
     target_source = posterior.get("target_scale")
     if scale_source is None:
@@ -370,13 +419,19 @@ def saturation_chart(
     if not chosen or any(channel not in channels for channel in chosen):
         raise ValueError("Select at least one fitted channel for saturation curves.")
     post, scales, target_scale = _posterior(bundle)
+    if not manifest.get("adstock_normalize", True):
+        raise ValueError("Sustained-spend curves require normalized adstock.")
     nice = _labels(manifest)
     weekly = _get(bundle, "weekly")
     fig = go.Figure()
     for channel in chosen:
         i = channels.index(channel)
         color = COLORS[i % len(COLORS)]
-        grid = np.linspace(0, max(scales[i] * 1.2, float(weekly[channel].max()) * 1.2), 220)
+        historical_max = float(weekly[channel].max())
+        mean_spend = float(weekly[channel].mean())
+        if not np.isfinite(historical_max) or historical_max <= 0:
+            raise ValueError(f"Channel has no positive historical spend: {channel}")
+        grid = np.unique(np.r_[np.linspace(0, historical_max * 1.2, 220), historical_max, mean_spend])
         x = grid / scales[i]
         response = np.zeros((post["beta"].shape[0], len(grid)))
         positive = x > 0
@@ -386,15 +441,20 @@ def saturation_chart(
                 * (np.log(x[None, positive]) - np.log(post["kappa"][:, i, None]))
             ) * target_scale
         )
+        low, high = np.quantile(response, [0.05, 0.95], axis=0)
         if len(chosen) == 1:
-            low, high = np.quantile(response, [0.05, 0.95], axis=0)
             _band(fig, grid, low, high, color, "90% credible interval", legendgroup=channel)
-        fig.add_trace(go.Scatter(
-            x=grid, y=response.mean(axis=0), mode="lines", name=nice.get(channel, channel),
-            legendgroup=channel, line=dict(color=color, width=2.7),
-            hovertemplate="Weekly spend: %{x:,.0f}<br>Modeled weekly orders: %{y:,.1f}<extra>%{fullData.name}</extra>",
-        ))
-        mean_spend = float(weekly[channel].mean())
+        for extrapolation in (False, True):
+            mask = grid >= historical_max if extrapolation else grid <= historical_max
+            fig.add_trace(go.Scatter(
+                x=grid[mask], y=response.mean(axis=0)[mask], mode="lines", name=nice.get(channel, channel),
+                legendgroup=channel, showlegend=not extrapolation,
+                line=dict(color=color, width=2.7, dash="dash" if extrapolation else "solid"),
+                customdata=np.column_stack([low[mask], high[mask]]),
+                hovertemplate=("Sustained weekly spend: %{x:,.0f}<br>Modeled channel orders/week: %{y:,.1f}<br>"
+                               "90% credible interval: %{customdata[0]:,.1f}–%{customdata[1]:,.1f}"
+                               "<extra>%{fullData.name}</extra>"),
+            ))
         mean_x = mean_spend / scales[i]
         mean_orders = 0.0 if mean_x <= 0 else float(np.mean(
             post["beta"][:, i] * expit(post["slope"][:, i] * (np.log(mean_x) - np.log(post["kappa"][:, i]))) * target_scale
@@ -403,9 +463,11 @@ def saturation_chart(
             x=[mean_spend], y=[mean_orders], mode="markers", name=nice.get(channel, channel),
             showlegend=False, legendgroup=channel,
             marker=dict(size=9, color=color, line=dict(color="white", width=1.5)),
-            hovertemplate="Historical mean spend: %{x:,.0f}<br>Curve response: %{y:,.1f}<extra>%{fullData.name}</extra>",
+            hovertemplate=("Historical-average weekly spend: %{x:,.0f}<br>"
+                           "Response at sustained average spend: %{y:,.1f}<extra>%{fullData.name}</extra>"),
         ))
-    _layout(fig, "Channel saturation response", "Modeled weekly marketing orders", height=500, x_title="Constant weekly spend")
+    _layout(fig, "Channel saturation response<br><sup>Dashed: above historical maximum spend</sup>",
+            "Modeled channel orders per week", height=550, x_title="Sustained weekly spend")
     fig.update_layout(hovermode="closest")
     fig.update_xaxes(tickformat=",.0f", rangemode="tozero")
     fig.update_yaxes(rangemode="tozero")
@@ -422,6 +484,8 @@ def adstock_chart(
         raise ValueError("Select at least one fitted channel for adstock curves.")
     post, _, _ = _posterior(bundle)
     length = int(manifest.get("adstock_l_max", 8))
+    if length < 1:
+        raise ValueError("Adstock lag window must be positive.")
     normalized = bool(manifest.get("adstock_normalize", True))
     lags = np.arange(length)
     nice = _labels(manifest)
@@ -432,76 +496,108 @@ def adstock_chart(
         weights = post["alpha"][:, i, None] ** lags[None, :]
         if normalized:
             weights /= weights.sum(axis=1, keepdims=True)
+        low, high = np.quantile(weights * 100, [0.05, 0.95], axis=0)
         if len(chosen) == 1:
-            low, high = np.quantile(weights * 100, [0.05, 0.95], axis=0)
             _band(fig, lags, low, high, color, "90% credible interval", legendgroup=channel)
         fig.add_trace(go.Scatter(
             x=lags, y=100 * weights.mean(axis=0), name=nice.get(channel, channel), mode="lines+markers",
             line=dict(color=color, width=2.4), marker=dict(size=5), legendgroup=channel,
-            hovertemplate="Lag: %{x} weeks<br>Adstock weight: %{y:.1f}%<extra>%{fullData.name}</extra>",
+            customdata=np.column_stack([low, high]),
+            hovertemplate=("Lag: %{x} weeks<br>Adstock weight: %{y:.1f}%<br>"
+                           "90% credible interval: %{customdata[0]:.1f}%–%{customdata[1]:.1f}%"
+                           "<extra>%{fullData.name}</extra>"),
         ))
-    _layout(fig, "Weekly adstock weights", "Share of normalized adstock kernel (%)" if normalized else "Weight relative to week 0 (%)", height=480, x_title="Weeks since media exposure (0 = same week)")
+    _layout(fig, "Weekly adstock weights<br><sup>Spend memory before saturation</sup>",
+            "Share of normalized adstock kernel (%)" if normalized else "Weight relative to week 0 (%)",
+            height=520, x_title="Weeks since media exposure (0 = same week)")
     fig.update_xaxes(tickmode="linear", dtick=1)
     fig.update_yaxes(rangemode="tozero", tickformat=".0f", ticksuffix="%")
     return fig
 
 
-def budget_chart(allocation: pd.DataFrame, manifest: Mapping[str, Any]) -> go.Figure:
+def budget_chart(
+    allocation: pd.DataFrame, manifest: Mapping[str, Any], period_totals: bool = False,
+) -> go.Figure:
+    """Compare continuation and optimized spend; CPA includes historical carry-in."""
     data = allocation.copy()
     aliases = {
         "current_spend": "historical_weekly_spend",
         "recommended_spend": "optimized_weekly_spend",
+        "current_total_spend": "historical_period_spend",
+        "recommended_total_spend": "optimized_period_spend",
+        "current_CPA": "historical_modeled_cpa",
+        "optimized_CPA": "optimized_modeled_cpa",
     }
     for old, new in aliases.items():
         if new not in data and old in data:
             data[new] = data[old]
-    required = {"channel", "historical_weekly_spend", "optimized_weekly_spend"}
+    suffix = "period_spend" if period_totals else "weekly_spend"
+    current, optimized = f"historical_{suffix}", f"optimized_{suffix}"
+    required = {"channel", current, optimized}
     if not required.issubset(data.columns):
         raise ValueError(f"Budget table is missing: {sorted(required.difference(data.columns))}")
-    data = data.sort_values("optimized_weekly_spend", ascending=False)
+    if not np.isfinite(data[[current, optimized]].to_numpy(dtype=float)).all():
+        raise ValueError("Budget amounts must be finite.")
+    if data[[current, optimized]].lt(0).any().any():
+        raise ValueError("Budget amounts must be nonnegative.")
+    data = data.sort_values(optimized, ascending=False)
     nice = _labels(manifest)
     data["label"] = data["channel"].map(nice).fillna(data["channel"])
-    change = data["optimized_weekly_spend"] - data["historical_weekly_spend"]
+    change = data[optimized] - data[current]
     percent = np.divide(
-        100 * change.to_numpy(), data["historical_weekly_spend"].to_numpy(),
-        out=np.full(len(data), np.nan), where=data["historical_weekly_spend"].to_numpy() > 0,
+        100 * change.to_numpy(), data[current].to_numpy(),
+        out=np.full(len(data), np.nan), where=data[current].to_numpy() > 0,
     )
     change_labels = [
         "New" if old == 0 and new > 0 else "No change" if old == 0 else f"{pct:+.1f}%"
-        for old, new, pct in zip(data["historical_weekly_spend"], data["optimized_weekly_spend"], percent)
+        for old, new, pct in zip(data[current], data[optimized], percent)
     ]
     fig = go.Figure()
-    for column, label, color in [
-        ("historical_weekly_spend", "Historical average weekly spend", BLUE),
-        ("optimized_weekly_spend", "Recommended weekly spend", ORANGE),
+    unit = "Planning-period spend" if period_totals else "Weekly spend"
+    for column, cpa_column, label, color in [
+        (current, "historical_modeled_cpa", "Historical-average continuation", BLUE),
+        (optimized, "optimized_modeled_cpa", "Optimized allocation", ORANGE),
     ]:
+        cpa = data[cpa_column] if cpa_column in data else pd.Series(np.nan, index=data.index)
+        cpa_labels = [f"{value:,.2f}" if np.isfinite(value)
+                      else "Unbounded" if np.isposinf(value) else "n/a" for value in cpa]
         fig.add_bar(
             x=data["label"], y=data[column], name=label, marker_color=color,
-            hovertemplate="<b>%{x}</b><br>Weekly spend: %{y:,.2f}<extra>%{fullData.name}</extra>",
+            customdata=np.column_stack([cpa_labels, change_labels]),
+            hovertemplate=("<b>%{x}</b><br>" + unit + ": %{y:,.2f}<br>"
+                           "Projected media CPA: %{customdata[0]}<br>"
+                           "Recommended spend change: %{customdata[1]}<extra>%{fullData.name}</extra>"),
         )
-    peak = max(float(data[["historical_weekly_spend", "optimized_weekly_spend"]].max().max()), 1.0)
+    peak = max(float(data[[current, optimized]].max().max()), 1.0)
     for index, (_, row) in enumerate(data.iterrows()):
         fig.add_annotation(
-            x=row["label"], y=max(row["historical_weekly_spend"], row["optimized_weekly_spend"]) + peak * 0.04,
+            x=row["label"], y=max(row[current], row[optimized]) + peak * 0.04,
             text=change_labels[index], showarrow=False,
             font=dict(size=12, color=TEAL if change.iloc[index] > 0 else "#B91C1C" if change.iloc[index] < 0 else "#64748B"),
         )
-    _layout(fig, "Historical average vs recommended budget", "Weekly spend", height=500, x_title="")
+    title = "Budget allocation over the planning period" if period_totals else "Weekly budget allocation"
+    _layout(fig, title, "Total spend over planning horizon" if period_totals else "Weekly spend", height=530, x_title="")
     fig.update_layout(barmode="group", bargap=0.25)
     fig.update_xaxes(categoryorder="array", categoryarray=data["label"].tolist(), tickangle=-25)
     fig.update_yaxes(range=[0, peak * 1.2])
     return fig
 
 
-def forecast_chart(weekly_forecast: pd.DataFrame, media_only: bool = False) -> go.Figure:
+def forecast_chart(
+    weekly_forecast: pd.DataFrame, media_only: bool = False,
+    include_historical_mix: bool = False,
+) -> go.Figure:
     data = _sorted(weekly_forecast)
     fig = go.Figure()
     measure = "media_orders" if media_only else "total_orders"
-    columns = [
-        ("current", "Continue historical spending", BLUE),
-        ("reference", "Feasible same-budget reference", "#64748B"),
-        ("optimized", "Optimized allocation", ORANGE),
-    ]
+    columns = [("current", "Continue historical spending", BLUE)]
+    if f"feasible_reference_{measure}" in data:
+        columns.append(("feasible_reference", "Feasible equal-budget reference", "#64748B"))
+        if include_historical_mix:
+            columns.append(("reference", "Historical mix, same budget", "#8B5CF6"))
+    else:
+        columns.append(("reference", "Historical mix, same budget", "#64748B"))
+    columns.append(("optimized", "Optimized allocation", ORANGE))
     for scenario, name, color in columns:
         column = f"{scenario}_{measure}"
         if column not in data and f"{scenario}_expected_orders" in data:
@@ -511,13 +607,14 @@ def forecast_chart(weekly_forecast: pd.DataFrame, media_only: bool = False) -> g
         if scenario == "optimized":
             for lower, upper in [(f"{column}_lower_90", f"{column}_upper_90"), ("optimized_lower", "optimized_upper"), ("optimized_lower_90", "optimized_upper_90")]:
                 if {lower, upper}.issubset(data.columns):
-                    _band(fig, data["date"], data[lower], data[upper], color, "Optimized: 90% interval")
+                    _band(fig, data["date"], data[lower], data[upper], color, "Optimized: 90% expected-mean credible interval")
                     break
         fig.add_trace(go.Scatter(
             x=data["date"], y=data[column], name=name, mode="lines+markers",
-            line=dict(color=color, width=2.6, dash="dot" if scenario == "reference" else "solid"),
+            line=dict(color=color, width=2.6, dash="dot" if "reference" in scenario else "solid"),
             marker=dict(size=5), hovertemplate="%{x|%d %b %Y}<br>Modeled orders: %{y:,.1f}<extra>%{fullData.name}</extra>",
         ))
     if not fig.data:
         raise ValueError("Forward forecasts contain no recognized order columns.")
     return _layout(fig, "Forward modeled marketing orders" if media_only else "Forward expected total orders", "Weekly modeled media orders" if media_only else "Weekly expected total orders", height=430)
+

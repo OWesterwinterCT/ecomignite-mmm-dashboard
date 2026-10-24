@@ -7,15 +7,21 @@ import pandas as pd
 
 from ecomignite.engine import (
     adstock_weights, forward_media_draws, hill_response, nonmedia_draws, optimize_budget,
+    validate_fitted_checkpoint,
 )
 
 
 def bundle_factory(zero_recent=False):
     rng = np.random.default_rng(22)
     samples, periods = 36, 48
-    channels = ["meta_conversion_spend", "google_search_spend", "google_display_spend"]
+    channels = [
+        "meta_conversion_spend", "meta_engagement_spend", "meta_traffic_spend",
+        "google_search_spend", "google_pmax_spend", "google_display_spend",
+        "google_video_spend", "google_shopping_spend", "google_demand_gen_spend",
+    ]
+    count = len(channels)
     dates = pd.date_range("2024-01-01", periods=periods, freq="7D")
-    spends = rng.uniform(45, 150, (periods, 3))
+    spends = rng.uniform(45, 150, (periods, count))
     if zero_recent:
         spends[-8:, 0] = 0
     weekly = pd.DataFrame(spends, columns=channels)
@@ -23,17 +29,17 @@ def bundle_factory(zero_recent=False):
     weekly["eligible_orders"] = 300
     weekly["discount_rate"] = rng.uniform(0.01, 0.05, periods)
     posterior = {
-        "alpha": rng.beta(2, 3, (samples, 3)),
-        "beta": rng.uniform(0.10, 0.40, (samples, 3)),
-        "kappa": rng.uniform(0.5, 1.5, (samples, 3)),
-        "slope": rng.uniform(0.6, 1.9, (samples, 3)),
+        "alpha": rng.beta(2, 3, (samples, count)),
+        "beta": rng.uniform(0.10, 0.40, (samples, count)),
+        "kappa": rng.uniform(0.5, 1.5, (samples, count)),
+        "slope": rng.uniform(0.6, 1.9, (samples, count)),
         "channel_scale": spends.max(axis=0),
         "target_scale": 600.0,
         "intercept": rng.uniform(0.2, 0.3, samples),
         "gamma_control": np.tile([0.05, 0.01], (samples, 1)),
         "gamma_fourier": np.tile([0.01, 0.02, 0.03, 0.04], (samples, 1)),
     }
-    posterior["alpha"][:, 1] = rng.beta(2, 98, samples)
+    posterior["alpha"][:, channels.index("google_search_spend")] = rng.beta(2, 98, samples)
     manifest = {
         "channels": channels,
         "controls": ["discount_rate_scaled", "linear_trend_scaled"],
@@ -88,6 +94,32 @@ class ForwardMathTests(unittest.TestCase):
         np.testing.assert_allclose(total, expected)
         np.testing.assert_allclose(total, sum(parts.values()))
 
+    def test_fitted_checkpoint_is_paired_and_detects_misaligned_inputs(self):
+        bundle = bundle_factory()
+        posterior = bundle.posterior
+        spend = bundle.weekly[bundle.manifest["channels"]].to_numpy() / posterior["channel_scale"]
+        expected = np.empty_like(posterior["alpha"])
+        for sample in range(len(expected)):
+            for channel in range(expected.shape[1]):
+                alpha = posterior["alpha"][sample, channel]
+                w = alpha ** np.arange(8)
+                w /= w.sum()
+                x = np.convolve(spend[:, channel], w)[:len(spend)][-1]
+                power = x ** posterior["slope"][sample, channel]
+                expected[sample, channel] = posterior["beta"][sample, channel] * power / (
+                    power + posterior["kappa"][sample, channel] ** posterior["slope"][sample, channel])
+        posterior["fitted_last_channel_contribution"] = expected
+        dates = bundle.weekly.date.iloc[-1:]
+        nonmedia, _ = nonmedia_draws(bundle, dates, float(bundle.weekly.discount_rate.iloc[-1]))
+        posterior["fitted_last_mu"] = expected.sum(axis=1) + nonmedia[:, 0] / posterior["target_scale"]
+        self.assertEqual(validate_fitted_checkpoint(bundle)["status"], "verified")
+        posterior["channel_scale"][0] *= 2
+        with self.assertRaisesRegex(ValueError, "media checkpoint"):
+            validate_fitted_checkpoint(bundle)
+
+    def test_old_bundle_without_checkpoint_remains_supported(self):
+        self.assertEqual(validate_fitted_checkpoint(bundle_factory())["status"], "unavailable")
+
 
 class OptimizerTests(unittest.TestCase):
     def settings(self, **extra):
@@ -102,6 +134,9 @@ class OptimizerTests(unittest.TestCase):
         self.assertTrue((table["optimized_weekly_spend"] <= table["max_weekly_spend"] + 1e-6).all())
         self.assertLessEqual(summary["optimized_period_budget"], summary["total_budget_cap"] + 1e-6)
         self.assertAlmostEqual(table["reference_period_spend"].sum(), table["optimized_period_spend"].sum(), places=6)
+        self.assertAlmostEqual(table["feasible_reference_period_spend"].sum(), table["optimized_period_spend"].sum(), places=6)
+        self.assertTrue((table["feasible_reference_weekly_spend"] >= table["min_weekly_spend"] - 1e-6).all())
+        self.assertTrue((table["feasible_reference_weekly_spend"] <= table["max_weekly_spend"] + 1e-6).all())
         self.assertEqual(result["weekly_plan"]["date"].iloc[0], bundle.weekly["date"].max() + pd.Timedelta(days=7))
         direct = forward_media_draws(bundle, np.tile(recommended, (summary["horizon_weeks"], 1))).sum(axis=2).mean(axis=0)
         np.testing.assert_allclose(result["weekly_forecast"]["optimized_media_orders"], direct)
@@ -109,6 +144,10 @@ class OptimizerTests(unittest.TestCase):
         c = result["posterior_comparison"]
         np.testing.assert_allclose(c["optimized_total_orders"] - c["reference_total_orders"],
                                    c["optimized_media_orders"] - c["reference_media_orders"], atol=1e-10)
+        np.testing.assert_allclose(c["optimized_total_orders"] - c["feasible_reference_total_orders"],
+                                   c["gain_vs_feasible_same_budget"], atol=1e-10)
+        self.assertEqual(summary["headline_comparison"], "feasible_reference")
+        self.assertEqual(summary["gain_vs_same_budget_reference"], summary["gain_vs_feasible_same_budget"])
 
     def test_budget_search_and_12_week_horizon(self):
         bundle = bundle_factory()
@@ -146,6 +185,15 @@ class OptimizerTests(unittest.TestCase):
                                    table["historical_weekly_spend"] / table["historical_weekly_spend"].sum())
         self.validate(bundle, result)
         self.assertFalse(result["summary"]["same_budget_reference_feasible"])
+        self.assertTrue(result["summary"]["feasible_reference_adjusted_historical_proportions"])
+        draws = result["posterior_comparison"]
+        paired_gain = draws["optimized_total_orders"] - draws["feasible_reference_total_orders"]
+        gain = result["summary"]["gain_vs_same_budget_reference"]
+        self.assertAlmostEqual(gain["orders"], paired_gain.mean())
+        self.assertAlmostEqual(gain["lower_90"], np.quantile(paired_gain, .05))
+        self.assertAlmostEqual(gain["upper_90"], np.quantile(paired_gain, .95))
+        self.assertAlmostEqual(gain["pct_total"], 100 * paired_gain.mean() / draws["feasible_reference_total_orders"].mean())
+        self.assertNotAlmostEqual(gain["pct_total"], gain["pct_media"])
 
     def test_one_week_long_horizon_and_unused_cap(self):
         bundle = bundle_factory()
@@ -188,6 +236,37 @@ class OptimizerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fraction"):
             optimize_budget(bundle, self.settings(future_discount_rate=10))
 
+    def test_nine_channels_no_smart_or_obsolete_meta_buckets(self):
+        bundle = bundle_factory()
+        result = optimize_budget(bundle, self.settings())
+        self.assertEqual(set(result["allocation"].channel), set(bundle.manifest["channels"]))
+        self.assertEqual(len(result["allocation"]), 9)
+        self.assertNotIn("google_smart_spend", result["allocation"].channel.tolist())
+        self.assertNotIn("meta_other_spend", result["allocation"].channel.tolist())
+        labels = result["allocation"].set_index("channel").channel_label
+        self.assertEqual(labels["google_video_spend"], "Google Video")
+        self.assertEqual(labels["google_shopping_spend"], "Google Shopping")
+        self.assertEqual(labels["google_demand_gen_spend"], "Google Demand Gen")
+
+    def test_zero_cap_and_hundred_percent_changes(self):
+        bundle = bundle_factory()
+        result = optimize_budget(bundle, self.settings(
+            total_budget_cap=0, max_spend_change=1.0, protect_search=False,
+        ))
+        self.validate(bundle, result)
+        self.assertEqual(result["allocation"].optimized_period_spend.sum(), 0)
+        # Historical spending can still contribute during the first future weeks.
+        self.assertGreater(result["summary"]["optimized_total_media_orders"], 0)
+        self.assertAlmostEqual(result["summary"]["gain_vs_same_budget_reference"]["orders"], 0)
+
+    def test_unknown_bound_key_is_rejected(self):
+        bundle = bundle_factory()
+        with self.assertRaisesRegex(ValueError, "min.*max"):
+            optimize_budget(bundle, self.settings(
+                channel_weekly_bounds={"google_video_spend": {"maximum": 100}}
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()
+

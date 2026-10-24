@@ -29,6 +29,9 @@ CHANNEL_LABELS = {
     "google_search_spend": "Google Search",
     "google_pmax_spend": "Google Performance Max",
     "google_display_spend": "Google Display",
+    "google_video_spend": "Google Video",
+    "google_shopping_spend": "Google Shopping",
+    "google_demand_gen_spend": "Google Demand Gen",
 }
 CONTROL_LABELS = {
     "discount_rate_scaled": "Discounts",
@@ -212,6 +215,22 @@ def _control_references(control_scaling):
     return scaling
 
 
+def _audit_table(frame, index_name):
+    """Keep optional aggregate OOS tables portable and JSON-safe."""
+    if frame is None:
+        return None, []
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("Optional OOS metrics/quality must be pandas DataFrames.")
+    out = frame.copy()
+    if not isinstance(out.index, pd.RangeIndex) or out.index.name is not None:
+        out = out.rename_axis(index_name).reset_index()
+    if not out.columns.is_unique:
+        raise ValueError("Optional OOS tables contain duplicate columns.")
+    # Pandas serializes NaN/infinite diagnostic values to null, not invalid JSON.
+    records = json.loads(out.to_json(orient="records", date_format="iso"))
+    return out, records
+
+
 def export_dashboard_bundle(
     mmm,
     fitted_data,
@@ -225,6 +244,9 @@ def export_dashboard_bundle(
     oos_X=None,
     oos_y=None,
     oos_training_end=None,
+    oos_evaluation_type=None,
+    oos_metrics=None,
+    oos_input_quality=None,
     fit_interval_level=0.90,
     oos_intervals_type="expected_mean",
     currency="",
@@ -238,7 +260,9 @@ def export_dashboard_bundle(
     are joined by date without replacing any model inputs. Supply either an OOS
     table in original order units, or a separate training-only fitted model plus
     holdout X/y. For a direct OOS table, `oos_training_end` records the last date
-    used to estimate its model; it must precede the first holdout date.
+    used to estimate its model. The supplied table must contain every trailing
+    fitted-period week after that cutoff. Optional OOS metadata describes the
+    evaluation and its aggregate metrics/input quality, without rerunning it.
     """
     if not 0 < float(fit_interval_level) < 1:
         raise ValueError("fit_interval_level must be between 0 and 1.")
@@ -288,6 +312,16 @@ def export_dashboard_bundle(
         "meta_record_missing", "google_record_missing", "discount_amount",
         "gross_revenue", "refund_amount", "discount_rate", "refund_rate",
     }
+    for prefix in ("meta", "google"):
+        quality_names.update(f"{prefix}_{suffix}" for suffix in (
+            "source_missing", "source_missing_days", "spend_imputed",
+            "backfilled_days", "record_missing_days",
+        ))
+    for channel in channels:
+        quality_names.update(f"{channel}_{suffix}" for suffix in (
+            "original", "imputed", "imputed_days", "imputed_spend",
+            "imputed_share", "backfilled_days", "record_missing",
+        ))
     exported_columns = ["date", "eligible_orders", *channels, *controls]
     exported_columns += [c for c in data if c in quality_names or c == "net_revenue"]
     data = data[list(dict.fromkeys(exported_columns))]
@@ -383,6 +417,10 @@ def export_dashboard_bundle(
             sample_count, size=int(max_posterior_draws), replace=False))
     arrays = {key: values[keep] for key, values in samples.items()}
     arrays.update(channel_scale=scale_x, target_scale=np.asarray(scale_y), intercept=intercept[keep] / scale_y)
+    # Model-scale references let the dashboard verify its forward-response
+    # implementation against the fitted model using the same retained draws.
+    arrays["fitted_last_channel_contribution"] = media[keep, -1, :] / scale_y
+    arrays["fitted_last_mu"] = mu[keep, -1] / scale_y
     arrays["gamma_control"] = (
         _samples(post["gamma_control"], ("control",), {"control": controls})[keep]
         if controls else np.empty((len(keep), 0))
@@ -405,6 +443,14 @@ def export_dashboard_bundle(
 
     if oos_fit is not None and oos_model is not None:
         raise ValueError("Supply an OOS table OR an OOS model, not both.")
+    allowed_evaluations = {
+        None, "conditional_on_realized_media_and_discounts",
+        "forecast_with_planned_inputs",
+    }
+    if oos_evaluation_type not in allowed_evaluations:
+        raise ValueError("Unsupported oos_evaluation_type.")
+    metric_table, metric_records = _audit_table(oos_metrics, "model")
+    quality_table, quality_records = _audit_table(oos_input_quality, "channel")
     oos = None
     oos_info = {"status": "unavailable", "reason": "No training-only OOS evaluation was supplied."}
     if oos_fit is not None:
@@ -412,7 +458,7 @@ def export_dashboard_bundle(
             raise ValueError("A direct OOS table requires oos_training_end to document the training cutoff.")
         oos = _validate_fit_table(oos_fit, fit_interval_level)
         cutoff = pd.Timestamp(oos_training_end)
-        if len(oos) == 0 or cutoff >= oos.date.min():
+        if pd.isna(cutoff) or len(oos) == 0 or cutoff >= oos.date.min():
             raise ValueError("The OOS training cutoff must precede the holdout.")
         if oos_intervals_type not in {"expected_mean", "posterior_predictive", "unavailable"}:
             raise ValueError("Invalid oos_intervals_type.")
@@ -429,21 +475,33 @@ def export_dashboard_bundle(
                     "training_end": _dates_from_posterior(oos_model).max().date().isoformat(),
                     "intervals_type": "expected_mean"}
     if oos is not None:
+        cutoff = pd.Timestamp(oos_info["training_end"])
+        if cutoff not in dates:
+            raise ValueError("OOS training cutoff must be a fitted-period week.")
+        if not pd.DatetimeIndex(oos.date).equals(dates[dates > cutoff]):
+            raise ValueError("OOS must include every trailing week after the training cutoff.")
         if not set(oos.date).issubset(set(dates)):
             raise ValueError("OOS dates must be held-out weeks within the full-period dashboard dataset.")
         expected_y = data.set_index("date").loc[oos.date, "eligible_orders"].to_numpy()
         np.testing.assert_allclose(oos.observed, expected_y, rtol=1e-8, atol=1e-8,
             err_msg="OOS observed orders differ from the full-period data.")
         oos_info.update(weeks=len(oos), start=oos.date.min().date().isoformat(),
-                        end=oos.date.max().date().isoformat())
+                        end=oos.date.max().date().isoformat(),
+                        evaluation_type=oos_evaluation_type or "not_supplied",
+                        metrics=metric_records, input_quality=quality_records)
+    elif metric_table is not None or quality_table is not None or oos_evaluation_type is not None:
+        raise ValueError("OOS metadata requires an OOS fit table or training-only model.")
 
     # Do not infer centering or pretend unknown references are known.
     scaling_available = all(k in scaling for k in ("discount_unit", "trend_origin", "trend_span_days"))
     manifest = {
         "schema_version": 1, "kind": "real", "model_name": "Ecomignite Orders MMM",
+        "exporter_version": "2026.10.24", "spend_scope": "modeled_channels_only",
         "target_column": "eligible_orders", "target_label": "Orders", "date_column": "date",
         "granularity": "weekly", "week_starts": "Monday", "currency": str(currency),
         "channels": channels, "channel_labels": {c: CHANNEL_LABELS.get(c, c) for c in channels},
+        "channel_notes": ({"google_video_spend": "Google Video can include YouTube and video partners; other Google campaign types may also deliver on YouTube."}
+                          if "google_video_spend" in channels else {}),
         "controls": controls, "control_labels": {c: CONTROL_LABELS.get(c, c) for c in controls},
         "adstock_l_max": int(mmm.adstock.l_max), "adstock_normalize": True, "adstock_first": True,
         "saturation": "Hill", "yearly_seasonality": yearly_order, "fourier_names": fourier_names,
@@ -468,13 +526,17 @@ def export_dashboard_bundle(
         np.savez_compressed(stage / "posterior.npz", **arrays)
         if oos is not None:
             oos.to_csv(stage / "fit_oos.csv", index=False, date_format="%Y-%m-%d")
+        if metric_table is not None:
+            metric_table.to_csv(stage / "oos_metrics.csv", index=False)
+        if quality_table is not None:
+            quality_table.to_csv(stage / "oos_input_quality.csv", index=False)
         if daily_validation is not None:
             daily = _date_frame(daily_validation)
             columns = ["date"] + [c for c in daily if c in quality_names or c in channels]
             daily[columns].to_csv(stage / "validation_daily.csv", index=False, date_format="%Y-%m-%d")
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8")
         output.mkdir(parents=True, exist_ok=True)
-        for filename in ("fit_oos.csv", "validation_daily.csv"):
+        for filename in ("fit_oos.csv", "validation_daily.csv", "oos_metrics.csv", "oos_input_quality.csv"):
             old = output / filename
             if not (stage / filename).exists() and old.exists():
                 old.unlink()  # Avoid displaying stale optional exports from a prior run.
@@ -488,3 +550,4 @@ def export_dashboard_bundle(
     print("Uploadable ZIP:", archive)
     print("OOS:", oos_info["status"])
     return {"bundle_dir": output, "zip_path": archive, "manifest": manifest}
+

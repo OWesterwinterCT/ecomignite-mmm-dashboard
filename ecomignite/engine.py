@@ -22,6 +22,9 @@ CHANNEL_LABELS = {
     "google_search_spend": "Google Search",
     "google_pmax_spend": "Google Performance Max",
     "google_display_spend": "Google Display",
+    "google_video_spend": "Google Video",
+    "google_shopping_spend": "Google Shopping",
+    "google_demand_gen_spend": "Google Demand Gen",
 }
 
 DEFAULT_SETTINGS = {
@@ -218,13 +221,52 @@ def _bounded_projection(values, lower, upper, target):
     return np.clip(values - (left + right) / 2, lower, upper)
 
 
+def validate_fitted_checkpoint(bundle):
+    """Verify paired exported draws against the final fitted week, when supplied.
+
+    Ordinary contribution CSV means may use more draws than posterior.npz, so
+    they are not an exact checkpoint for a subsampled model bundle.
+    """
+    posterior = bundle.posterior
+    if "fitted_last_channel_contribution" not in posterior:
+        return {"status": "unavailable", "reason": "This bundle has no paired fitted-response checkpoint."}
+    channels, weekly, observed, arrays, scale_x, scale_y, lag = _model_inputs(bundle)
+    alpha, beta, kappa, slope = arrays
+    expected = np.asarray(posterior["fitted_last_channel_contribution"], dtype=float)
+    if expected.shape != alpha.shape or not np.isfinite(expected).all():
+        raise ValueError("The fitted-response checkpoint must match the exported sample/channel axes.")
+    weights = adstock_weights(alpha, lag)
+    last_input = (weights * (observed[-lag:][::-1] / scale_x).T[None, :, :]).sum(axis=2)
+    reconstructed = hill_response(last_input, beta, kappa, slope)
+    if not np.allclose(reconstructed, expected, rtol=1e-5, atol=1e-7):
+        raise ValueError("Exported parameters and history do not reproduce the fitted media checkpoint. Re-export the matching model and data.")
+    result = {"status": "verified", "media_max_abs_model_scale_gap": float(np.max(np.abs(reconstructed - expected)))}
+    if "fitted_last_mu" in posterior:
+        expected_mu = np.asarray(posterior["fitted_last_mu"], dtype=float)
+        if expected_mu.shape != (len(alpha),) or not np.isfinite(expected_mu).all():
+            raise ValueError("The fitted mean checkpoint must have one value per exported draw.")
+        if "discount_rate_scaled" in bundle.manifest.get("controls", []):
+            if "discount_rate" not in weekly:
+                raise ValueError("Raw discount_rate is required to verify the fitted mean checkpoint.")
+            last_discount = float(weekly["discount_rate"].iloc[-1])
+        else:
+            last_discount = 0.0
+        nonmedia, _ = nonmedia_draws(bundle, [weekly["date"].iloc[-1]], last_discount)
+        reconstructed_mu = reconstructed.sum(axis=1) + nonmedia[:, 0] / scale_y
+        if not np.allclose(reconstructed_mu, expected_mu, rtol=1e-5, atol=1e-7):
+            raise ValueError("Exported baseline, controls or seasonality do not reproduce the fitted mean checkpoint. Re-export the matching model and control references.")
+        result["mu_max_abs_model_scale_gap"] = float(np.max(np.abs(reconstructed_mu - expected_mu)))
+    return result
+
+
 def optimize_budget(bundle, settings: dict | None = None) -> dict:
     """Find the best feasible repeated weekly allocation across a future horizon.
 
-    The main same-budget comparison retains the historical channel proportions,
-    scaled to the selected future budget. It intentionally does not impose new
-    channel bounds on that counterfactual. A separately named feasible reference
-    applies the bounds. Multistart SLSQP is not a guarantee of a global optimum.
+    The headline compares with a feasible same-budget reference formed from the
+    historical channel mix projected onto the active channel bounds. The original
+    historical proportions at the same budget and unscaled historical-average
+    continuation remain separate comparisons. Multistart SLSQP is not a guarantee
+    of a global optimum.
     """
     options = deepcopy(DEFAULT_SETTINGS)
     options.update(settings or {})
@@ -232,6 +274,7 @@ def optimize_budget(bundle, settings: dict | None = None) -> dict:
     reference = horizon if options["reference_weeks"] is None else _positive_integer(options["reference_weeks"], "reference_weeks")
     starts_count = _positive_integer(options["n_starts"], "n_starts")
     channels, weekly, observed, arrays, scale_x, scale_y, lag = _model_inputs(bundle)
+    checkpoint = validate_fitted_checkpoint(bundle)
     if reference > len(weekly):
         raise ValueError("The historical reference window exceeds the available fitted weeks.")
     current = observed[-reference:].mean(axis=0)
@@ -257,7 +300,7 @@ def optimize_budget(bundle, settings: dict | None = None) -> dict:
             upper[i] = min(upper[i], current[i] * (1 + change))
         changes.append(change)
         bounds = absolute.get(channel, {})
-        if set(bounds) - {"min", "max"}:
+        if not isinstance(bounds, dict) or set(bounds) - {"min", "max"}:
             raise ValueError(f"Use only 'min'/'max' weekly bounds for {channel}.")
         if bounds.get("min") is not None:
             lower[i] = max(lower[i], _finite_amount(bounds["min"], f"Minimum for {channel}"))
@@ -339,9 +382,9 @@ def optimize_budget(bundle, settings: dict | None = None) -> dict:
         return -float(evaluate(spend, subset=True).sum(axis=(1, 2)).mean()) / objective_scale
 
     records = []
-    if len(free) <= 1:
+    if len(free) <= 1 or selected_total <= lower.sum() + tolerance or selected_total >= upper.sum() - tolerance:
         records.append({"start": 0, "success": True, "feasible": feasible(best), "expected_media_orders": best_value,
-                        "message": "Direct monotone solution: zero or one free channel"})
+                        "message": "Direct monotone solution: allocation fixed by channel or total bounds"})
         solution_label = records[0]["message"]
     else:
         starting_points = [seed] + [_bounded_projection(rng.uniform(lo, hi), lo, hi, target) for _ in range(starts_count - 1)]
@@ -366,13 +409,16 @@ def optimize_budget(bundle, settings: dict | None = None) -> dict:
     feasible_mix = money_scale * _bounded_projection(historical_mix / money_scale, lower / money_scale,
                                                      upper / money_scale, best.sum() / money_scale)
     mix_value = float(evaluate(feasible_mix).sum(axis=(1, 2)).mean())
-    if mix_value > best_value:
+    if mix_value > best_value + 1e-10 * max(abs(best_value), 1.0):
         best, best_value = feasible_mix.copy(), mix_value
         solution_label = "Feasible same-budget reference retained on all posterior draws"
     if not feasible(best):
         raise RuntimeError("Selected optimizer solution is infeasible.")
     historical_mix = current * best.sum() / current.sum()
     np.testing.assert_allclose(historical_mix.sum(), best.sum(), atol=tolerance)
+    np.testing.assert_allclose(feasible_mix.sum(), best.sum(), atol=tolerance)
+    if not feasible(feasible_mix):
+        raise RuntimeError("The equal-budget reference is not feasible under the selected constraints.")
 
     future_discount = options["future_discount_rate"]
     if future_discount is None:
@@ -411,6 +457,7 @@ def optimize_budget(bundle, settings: dict | None = None) -> dict:
     current_channel = draws["current"].sum(axis=1).mean(axis=0)
     optimized_channel = draws["optimized"].sum(axis=1).mean(axis=0)
     reference_channel = draws["reference"].sum(axis=1).mean(axis=0)
+    feasible_reference_channel = draws["feasible_reference"].sum(axis=1).mean(axis=0)
     safe_ratio = lambda spend, orders: np.divide(spend, orders, out=np.full(len(channels), np.nan), where=orders > 0)
     allocation_table = pd.DataFrame({
         "channel": channels, "channel_label": [labels.get(name, name) for name in channels],
@@ -423,6 +470,10 @@ def optimize_budget(bundle, settings: dict | None = None) -> dict:
         "reference_weekly_spend": historical_mix, "reference_period_spend": horizon * historical_mix,
         "reference_media_orders": reference_channel,
         "reference_modeled_cpa": safe_ratio(horizon * historical_mix, reference_channel),
+        "feasible_reference_weekly_spend": feasible_mix,
+        "feasible_reference_period_spend": horizon * feasible_mix,
+        "feasible_reference_media_orders": feasible_reference_channel,
+        "feasible_reference_modeled_cpa": safe_ratio(horizon * feasible_mix, feasible_reference_channel),
         "min_weekly_spend": lower, "max_weekly_spend": upper, "search_protected": protected,
     }).sort_values("optimized_weekly_spend", ascending=False).reset_index(drop=True)
     weekly_plan = pd.DataFrame(np.tile(best, (horizon, 1)), columns=channels)
@@ -448,25 +499,36 @@ def optimize_budget(bundle, settings: dict | None = None) -> dict:
         "total_budget_cap": cap, "unused_budget_cap": float(max(0, cap - horizon * best.sum())),
         "current_total_media_orders": float(media_totals["current"].mean()),
         "reference_total_media_orders": float(media_totals["reference"].mean()),
+        "feasible_reference_total_media_orders": float(media_totals["feasible_reference"].mean()),
         "optimized_total_media_orders": float(media_totals["optimized"].mean()),
         "current_total_orders": float(total_orders["current"].mean()),
         "reference_total_orders": float(total_orders["reference"].mean()),
+        "feasible_reference_total_orders": float(total_orders["feasible_reference"].mean()),
         "optimized_total_orders": float(total_orders["optimized"].mean()),
         "gain_vs_current": gains("current"), "gain_vs_historical_same_budget": gains("reference"),
         "gain_vs_feasible_same_budget": gains("feasible_reference"),
+        "gain_vs_same_budget_reference": gains("feasible_reference"),
+        "headline_comparison": "feasible_reference",
+        "headline_comparison_label": "Feasible equal-budget reference",
+        "feasible_reference_adjusted_historical_proportions": not bool(np.allclose(feasible_mix, historical_mix, rtol=1e-8, atol=tolerance)),
         "same_budget_reference_feasible": feasible(historical_mix),
         "future_discount_rate": future_discount,
         "selected_solution": solution_label, "analytic_gradient": analytic,
         "optimization_draws": len(indices), "evaluation_draws": samples,
+        "fitted_response_check": checkpoint,
         "warnings": warnings,
     }
     comparison = pd.DataFrame({"current_media_orders": media_totals["current"],
                                "reference_media_orders": media_totals["reference"],
+                               "feasible_reference_media_orders": media_totals["feasible_reference"],
                                "optimized_media_orders": media_totals["optimized"],
                                "current_total_orders": total_orders["current"],
                                "reference_total_orders": total_orders["reference"],
+                               "feasible_reference_total_orders": total_orders["feasible_reference"],
                                "optimized_total_orders": total_orders["optimized"]})
     comparison["gain_vs_historical_same_budget"] = media_totals["optimized"] - media_totals["reference"]
+    comparison["gain_vs_feasible_same_budget"] = media_totals["optimized"] - media_totals["feasible_reference"]
+    comparison["gain_vs_current"] = media_totals["optimized"] - media_totals["current"]
     basis = pd.DataFrame({"channel": channels, "historical_weekly_spend": current,
                           "historical_max_weekly_spend": observed.max(axis=0),
                           "percentage_change_limit": changes, "min_weekly_spend": lower,
@@ -475,3 +537,4 @@ def optimize_budget(bundle, settings: dict | None = None) -> dict:
             "weekly_forecast": weekly_forecast, "summary": summary,
             "posterior_comparison": comparison, "spend_basis": basis,
             "solver_runs": pd.DataFrame(records), "settings": options}
+

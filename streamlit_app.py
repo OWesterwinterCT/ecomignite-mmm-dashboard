@@ -9,7 +9,10 @@ import pandas as pd
 import streamlit as st
 
 from ecomignite import charts
-from ecomignite.data import load_bundle, make_demo_bundle, fit_metrics, validation_summary
+from ecomignite.data import (
+    load_bundle, make_demo_bundle, fit_metrics, validation_summary,
+    CURRENT_CHANNELS, CURRENT_CHANNEL_LABELS,
+)
 from ecomignite.engine import optimize_budget
 
 st.set_page_config(page_title="Ecomignite | Marketing Measurement", page_icon="◈", layout="wide")
@@ -57,7 +60,7 @@ def fit_explanation(metrics, oos=False):
     return (f"The model {pattern} across {metrics['Weeks']} {scope}. "
             f"Absolute error totals {number(error, 1)}% of observed orders (WAPE), "
             f"with an average absolute error of {number(metrics['MAE'], 1)} orders per week. "
-            + ("These predictions assess performance on weeks excluded from that model's training."
+            + ("These predictions assess unseen orders conditional on the exported holdout inputs, including realized spend and discounts."
                if oos else "This describes historical fit; the holdout results provide a separate forecasting check."))
 
 
@@ -75,7 +78,8 @@ def render_fit(frame, title, key, oos=False, interval_kind="expected_mean", inte
                  "Actual model assessment appears after loading the notebook export.")
     else:
         st.write(fit_explanation(metrics, oos))
-    show_chart(charts.fit_chart(frame, title), key + "_chart")
+    show_chart(charts.fit_chart(frame, title, interval_kind=interval_kind,
+                               interval_level=interval_level), key + "_chart")
     with st.expander("Fit metrics and residuals"):
         st.dataframe(pd.DataFrame({"Metric": list(metrics), "Value": list(metrics.values())}), hide_index=True)
         show_chart(charts.residual_chart(frame), key + "_residual")
@@ -112,7 +116,7 @@ except (ValueError, KeyError, OSError, TypeError) as error:
 
 m = bundle.manifest
 channels = m["channels"]
-labels = m.get("channel_labels", {})
+labels = {**CURRENT_CHANNEL_LABELS, **m.get("channel_labels", {})}
 target = m.get("target_column", "eligible_orders")
 target_label = m.get("target_label", "Orders")
 is_demo = m.get("kind") == "demo"
@@ -122,6 +126,13 @@ st.title("Ecomignite")
 st.write("Understand performance, inspect the model, and plan the next marketing budget.")
 if is_demo:
     st.warning("SYNTHETIC DEMO — all numbers, curves, and validation examples are illustrative, not Ecomignite's fitted results.")
+elif set(channels) != set(CURRENT_CHANNELS):
+    missing_current = [labels.get(c,c) for c in CURRENT_CHANNELS if c not in channels]
+    extra = [labels.get(c,c) for c in channels if c not in CURRENT_CHANNELS]
+    st.info("This bundle uses a different channel specification from the updated nine-channel notebook. "
+            "Re-export the updated fitted model to display its results. "
+            + ("Missing current channels: " + ", ".join(missing_current) + ". " if missing_current else "")
+            + ("Additional channels in this bundle: " + ", ".join(extra) + "." if extra else ""))
 st.caption(f"{m.get('model_name', 'Orders MMM')}  ·  Weekly / Monday starts  ·  "
            f"{weekly.date.min():%d %b %Y} — {weekly.date.max():%d %b %Y}  ·  {len(weekly)} modeled weeks")
 
@@ -147,9 +158,10 @@ with summary_tab:
     cards = st.columns(4)
     cards[0].metric(target_label, number(visible[target].sum()))
     cards[1].metric("Net revenue", number(visible.net_revenue.sum(), 2) if "net_revenue" in visible else "Not supplied")
-    cards[2].metric("Marketing spend", number(visible[channels].sum().sum(), 2))
+    cards[2].metric("Modeled-channel spend", number(visible[channels].sum().sum(), 2))
     cards[3].metric("Displayed weeks", str(len(visible)))
-    st.caption("Totals cover the selected display period. Spend and revenue use the currency of the exported data.")
+    st.caption("Totals cover the selected display period. Spend includes fitted channels only; "
+               "Google Smart is excluded from the current model. Spend and revenue use the exported currency.")
     kpi_options = [target] + (["net_revenue"] if "net_revenue" in visible else [])
     kpis = st.multiselect("KPI timeline", kpi_options, default=[target],
         format_func=lambda c: target_label if c==target else "Net revenue")
@@ -193,6 +205,15 @@ with results_tab:
     oos_metadata = m.get("oos", {})
     if oos_metadata.get("training_end"):
         st.caption(f"Holdout-model training ended {oos_metadata['training_end']}.")
+    if not bundle.fit_oos.empty:
+        st.caption("All exported holdout weeks are included, including spike weeks. "
+                   "Fit plots and metrics use their full exported periods, independently of the sidebar display filter.")
+    if oos_metadata.get("metrics") or oos_metadata.get("input_quality"):
+        with st.expander("OOS benchmarks and input quality"):
+            if oos_metadata.get("metrics"):
+                st.dataframe(pd.DataFrame(oos_metadata["metrics"]), hide_index=True, width="stretch")
+            if oos_metadata.get("input_quality"):
+                st.dataframe(pd.DataFrame(oos_metadata["input_quality"]), hide_index=True, width="stretch")
     diagnostics=m.get("diagnostics",{})
     if diagnostics:
         with st.expander("Sampling diagnostics"):
@@ -207,7 +228,10 @@ with results_tab:
     effects["Component"] = effects.effect.map(nice).fillna(effects.effect)
     show_chart(charts.contribution_chart(c,m),"all_components")
     st.dataframe(effects[["Component","group","Total modeled orders","Share of modeled orders (%)"]].sort_values("Total modeled orders",ascending=False),hide_index=True,width="stretch")
-    st.caption("Contributions cover the selected display period and are signed. Discounts and trend use their anchored model references.")
+    st.caption("Contributions cover the selected display period and are signed. Discounts are relative to no discount; "
+               "trend is relative to the first fitting week. Modeled contributions are not experimental proof of incrementality.")
+    st.download_button("Download component contributions",csv_bytes(effects),
+                       "ecomignite_component_contributions.csv","text/csv")
     st.subheader("Marketing contributions")
     marketing_total=effects.loc[effects.group.eq("Marketing"),"Total modeled orders"].sum()
     a,b=st.columns(2)
@@ -230,17 +254,20 @@ with results_tab:
                                  format_func=lambda c:labels.get(c,c))
     curve_channels = None if selected_curve=="All channels" else [selected_curve]
     show_chart(charts.saturation_chart(bundle,curve_channels),"saturation")
-    st.caption("Hill curves show sustained effective weekly spend with normalized adstock. "
-               "The optimizer separately evaluates finite-horizon responses using the actual spend history.")
+    st.caption("Hill curves show sustained weekly spend with normalized adstock. Markers show response at sustained "
+               "historical-average spend; dashed segments exceed the observed maximum. "
+               "The optimizer evaluates the selected future horizon with actual historical carryover.")
     show_chart(charts.adstock_chart(bundle,curve_channels),"adstock")
-    st.caption("Lag 0 is the spending week. Normalized weights sum to one across the fitted lag window.")
+    st.caption("Lag 0 is the spending week. Weights are normalized within each posterior draw before averaging. "
+               "These describe spend memory before saturation, not the timing of attributed orders. "
+               "Google Video can include YouTube and video partners; other Google campaign types can also serve on YouTube.")
 
 with optimizer_tab:
     st.subheader("Plan the next marketing budget")
     st.write("Optimize a constant weekly allocation from the Monday after the fitted model ends. "
              "Historical spend initializes carryover; baseline, trend, discounts, and seasonality are shared across scenarios.")
-    st.caption("The headline uplift compares the optimized allocation with the historical channel mix at "
-               "the same total budget and over the same future weeks.")
+    st.caption("Headline uplift compares the optimized allocation with a feasible reference at the same total "
+               "budget and over the same future weeks. Constraints can adjust that reference away from historical proportions.")
     col1,col2,col3=st.columns(3)
     horizon=col1.number_input("Planning weeks",min_value=1,max_value=104,value=12,step=1)
     matched_reference=col2.checkbox("Use the same number of historical weeks",value=True)
@@ -292,7 +319,10 @@ with optimizer_tab:
         required_references.add("discount_unit")
     if "linear_trend_scaled" in m.get("controls",[]):
         required_references.update(["trend_origin","trend_span_days"])
-    can_optimize=required_references.issubset(references)
+    can_optimize=required_references.issubset(references) and R <= len(weekly)
+    if R > len(weekly):
+        st.info("The requested historical reference is longer than the fitted data. "
+                "Choose a shorter reference window or disable the matching-window option.")
     if not can_optimize:
         st.info("The control reference values were not exported. Model results remain available; "
                 "include CONTROL_SCALING in the notebook export to enable total-order budget forecasts.")
@@ -307,7 +337,7 @@ with optimizer_tab:
     if stored and stored[0]==settings_signature:
         result=stored[1]
         s=result["summary"]
-        gain=s["gain_vs_historical_same_budget"]
+        gain=s["gain_vs_same_budget_reference"]
         for warning in s.get("warnings",[]):
             st.warning(warning)
         a,b,c=st.columns(3)
@@ -316,22 +346,39 @@ with optimizer_tab:
         c.metric("Estimated total-order uplift",f"{gain['pct_total']:+.1f}%" if gain.get("pct_total") is not None else "Not available")
         st.caption(f"Planning: {s['planning_start']} — {s['planning_end']}  ·  Reference: {s['reference_start']} — {s['reference_end']}  ·  "
                    f"90% order-gain interval [{gain['lower_90']:+,.1f}, {gain['upper_90']:+,.1f}]")
+        st.caption(f"Feasible-reference total orders: {number(s['feasible_reference_total_orders'],1)} · "
+                   f"Optimized total orders: {number(s['optimized_total_orders'],1)} · "
+                   f"Unused budget cap: {number(s['unused_budget_cap'],2)}")
         st.write("Historical average and optimized allocation")
         allocation=result["allocation"]
         table_columns={"channel_label":"Channel", "historical_weekly_spend":"Historical avg weekly spend",
             "optimized_weekly_spend":"Optimized weekly spend", "spend_change_pct":"Change (%)",
-            "historical_modeled_cpa":"Current modeled CPA", "optimized_modeled_cpa":"Optimized modeled CPA",
-            "historical_period_spend":"Current period spend", "optimized_period_spend":"Optimized period spend"}
+            "historical_modeled_cpa":"Current projected media CPA", "optimized_modeled_cpa":"Optimized projected media CPA",
+            "historical_period_spend":"Current period spend", "optimized_period_spend":"Optimized period spend",
+            "historical_media_orders":"Current projected media orders", "optimized_media_orders":"Optimized projected media orders"}
         allocation_display=allocation[list(table_columns)].rename(columns=table_columns)
         st.dataframe(allocation_display.round(2),hide_index=True,width="stretch")
-        st.download_button("Download optimizer table (CSV)",csv_bytes(allocation_display),
+        st.download_button("Download optimizer table (CSV)",csv_bytes(allocation),
             f"ecomignite_budget_{s['horizon_weeks']}weeks.csv","text/csv",key="optimizer_csv")
-        show_chart(charts.budget_chart(allocation,m),"optimized_budget")
+        show_chart(charts.budget_chart(allocation,m,period_totals=True),"optimized_budget")
         show_chart(charts.forecast_chart(result["weekly_forecast"]),"optimized_forecast")
-        st.caption("The same-budget reference preserves historical channel proportions and can lie outside new channel constraints. "
-                   "Both scenarios use the same future weeks, carryover history, and non-marketing assumptions. "
+        st.caption("The headline reference satisfies channel constraints and uses the same total spend as the optimized allocation. "
+                   "The table and bars compare optimization with continuing recent-average spending, which can have a different total budget. "
+                   "All scenarios use the same future weeks, carryover history, and non-marketing assumptions. "
                    "Both CPA estimates divide future-period spend by modeled future-period media orders; "
-                   "the current scenario continues historical average spending. The uplift percentage uses total modeled orders.")
+                   "historical carry-in is included. Headline uplift uses total modeled orders, including baseline and controls. "
+                   "Forecast intervals describe the expected mean and exclude observation noise and future events not modeled.")
+        comparison = pd.DataFrame([
+            {"Comparison": label, "Additional modeled orders": s[key]["orders"],
+             "Total-order uplift (%)": s[key].get("pct_total"),
+             "Media-order uplift (%)": s[key].get("pct_media")}
+            for label,key in [
+                ("Feasible equal-budget reference (headline)","gain_vs_same_budget_reference"),
+                ("Historical mix at equal budget", "gain_vs_historical_same_budget"),
+                ("Historical-average continuation", "gain_vs_current"),
+            ]
+        ])
+        st.dataframe(comparison, hide_index=True, width="stretch")
         with st.expander("Scenario details, weekly plan, and optimizer checks"):
             st.json(s)
             st.dataframe(allocation,hide_index=True,width="stretch")
@@ -345,3 +392,4 @@ with optimizer_tab:
         st.info("Set the budget and channel limits, then run the optimizer.")
 
 st.caption("Ecomignite · Bayesian marketing measurement · Exported model results; no model fitting or database credentials required.")
+

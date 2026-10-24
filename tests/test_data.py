@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from ecomignite.data import make_demo_bundle, load_bundle, validate_bundle, fit_metrics
+from ecomignite.data import CURRENT_CHANNELS
 
 
 def bundle_zip(bundle):
@@ -57,3 +58,38 @@ def test_mape_excludes_zero_observations():
     metrics = fit_metrics(frame)
     assert metrics["MAPE eligible weeks"] == 2
     assert metrics["MAPE (%)"] == pytest.approx(10.)
+
+
+def test_current_demo_and_oos_observations():
+    bundle = make_demo_bundle()
+    assert bundle.manifest["channels"] == CURRENT_CHANNELS
+    assert len(CURRENT_CHANNELS) == 9
+    invalid = deepcopy(bundle)
+    invalid.fit_oos.loc[0, "observed"] += 1
+    with pytest.raises(ValueError, match="observed orders differ"):
+        validate_bundle(invalid)
+
+
+def test_oos_cutoff_and_intervals_rejected_when_invalid():
+    bundle = make_demo_bundle()
+    invalid = deepcopy(bundle)
+    invalid.manifest["oos"]["training_end"] = str(invalid.fit_oos.date.max().date())
+    with pytest.raises(ValueError, match="cutoff"):
+        validate_bundle(invalid)
+    invalid = deepcopy(bundle)
+    invalid.fit_oos.loc[0, "lower"] = invalid.fit_oos.loc[0, "upper"] + 1
+    with pytest.raises(ValueError, match="interval bounds"):
+        validate_bundle(invalid)
+
+
+def test_bad_reconstruction_and_control_rejected():
+    bundle = make_demo_bundle()
+    invalid = deepcopy(bundle)
+    invalid.contributions.loc[0, "mean"] += 5
+    with pytest.raises(ValueError, match="reconstruct"):
+        validate_bundle(invalid)
+    invalid = deepcopy(bundle)
+    invalid.weekly.loc[0, "discount_rate_scaled"] = np.nan
+    with pytest.raises(ValueError, match="modeled control"):
+        validate_bundle(invalid)
+

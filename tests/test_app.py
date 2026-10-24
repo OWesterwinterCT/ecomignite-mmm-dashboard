@@ -17,9 +17,14 @@ def test_default_dashboard_and_optimizer():
     assert not app.exception
     assert not app.error
     result = app.session_state["optimizer_result"][1]
-    assert len(result["allocation"]) == 8
+    assert len(result["allocation"]) == 9
     assert len(result["weekly_plan"]) == 12
     assert "Estimated total-order uplift" in [m.label for m in app.metric]
+    assert result["summary"]["headline_comparison"] == "feasible_reference"
+    assert set(result["allocation"]["channel"]) >= {
+        "google_video_spend", "google_shopping_spend", "google_demand_gen_spend"
+    }
+    assert "google_smart_spend" not in set(result["allocation"]["channel"])
 
 
 def test_configurable_horizon_and_visible_infeasible_budget():
@@ -47,3 +52,4 @@ def test_configurable_horizon_and_visible_infeasible_budget():
     assert not app.exception
     assert app.error
     assert "conflict" in app.error[0].value
+

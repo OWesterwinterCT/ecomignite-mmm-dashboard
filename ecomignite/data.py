@@ -9,6 +9,17 @@ import zipfile
 import numpy as np
 import pandas as pd
 
+CURRENT_CHANNELS = [
+    "meta_conversion_spend", "meta_engagement_spend", "meta_traffic_spend",
+    "google_search_spend", "google_pmax_spend", "google_display_spend",
+    "google_video_spend", "google_shopping_spend", "google_demand_gen_spend",
+]
+CURRENT_CHANNEL_LABELS = dict(zip(CURRENT_CHANNELS, [
+    "Meta Conversion", "Meta Engagement", "Meta Traffic", "Google Search",
+    "Google Performance Max", "Google Display", "Google Video",
+    "Google Shopping", "Google Demand Gen",
+]))
+
 
 @dataclass
 class ModelBundle:
@@ -86,12 +97,14 @@ def validate_bundle(bundle):
     if not channels or len(channels) != len(set(channels)):
         raise ValueError("Channels must be present and unique.")
     target = m.get("target_column", "eligible_orders")
-    missing = set(["date", target] + channels) - set(w)
+    missing = set(["date", target] + channels + controls) - set(w)
     if missing:
         raise ValueError(f"Missing weekly data columns: {sorted(missing)}")
     w.sort_values("date", inplace=True)
     w.reset_index(drop=True, inplace=True)
     dates = w["date"]
+    if len(w) < 2:
+        raise ValueError("At least two fitted weekly observations are required.")
     if dates.isna().any() or dates.duplicated().any() or not dates.dt.dayofweek.eq(0).all():
         raise ValueError("Weekly dates must be unique Monday starts.")
     if not dates.diff().dropna().eq(pd.Timedelta(days=7)).all():
@@ -100,6 +113,10 @@ def validate_bundle(bundle):
         w[c] = pd.to_numeric(w[c], errors="raise")
         if not np.isfinite(w[c]).all() or w[c].lt(0).any():
             raise ValueError(f"Invalid modeled input: {c}")
+    for c in controls:
+        w[c] = pd.to_numeric(w[c], errors="raise")
+        if not np.isfinite(w[c]).all():
+            raise ValueError(f"Invalid modeled control: {c}")
     C, K = len(channels), len(controls)
     if "alpha" not in p or p["alpha"].ndim != 2:
         raise ValueError("Posterior alpha must have sample and channel axes.")
@@ -123,6 +140,10 @@ def validate_bundle(bundle):
                         ("gamma_fourier", (S, 2 * int(m.get("yearly_seasonality", 0))))]:
         if name not in p or p[name].shape != shape or not np.isfinite(p[name]).all():
             raise ValueError(f"Invalid posterior shape/values: {name}")
+    for name, shape in [("fitted_last_channel_contribution", (S, C)),
+                        ("fitted_last_mu", (S,))]:
+        if name in p and (p[name].shape != shape or not np.isfinite(p[name]).all()):
+            raise ValueError(f"Invalid posterior shape/values: {name}")
     if not m.get("adstock_normalize", True) or not m.get("adstock_first", True):
         raise ValueError("This dashboard requires normalized geometric adstock before Hill saturation.")
     for name, frame in [("in-sample", bundle.fit_in_sample), ("OOS", bundle.fit_oos)]:
@@ -134,8 +155,32 @@ def validate_bundle(bundle):
             raise ValueError(f"Invalid {name} fit dates.")
         if not np.isfinite(frame[["observed", "predicted"]].to_numpy(dtype=float)).all():
             raise ValueError(f"Nonfinite {name} fit values.")
+        if not set(frame["date"]).issubset(set(dates)):
+            raise ValueError(f"{name} fit dates are outside the modeled period.")
+        observed = w.set_index("date")[target].reindex(frame["date"]).to_numpy(float)
+        if not np.allclose(frame["observed"].to_numpy(float), observed, rtol=1e-8, atol=1e-8):
+            raise ValueError(f"{name} observed orders differ from weekly model inputs.")
+        interval_columns = {"lower", "upper"} & set(frame)
+        if interval_columns and interval_columns != {"lower", "upper"}:
+            raise ValueError(f"{name} intervals require both lower and upper columns.")
+        if interval_columns:
+            bounds = frame[["lower", "upper"]].to_numpy(float)
+            if not np.isfinite(bounds).all() or (bounds[:, 0] > bounds[:, 1]).any():
+                raise ValueError(f"Invalid {name} interval bounds.")
+        frame.sort_values("date", inplace=True)
+        frame.reset_index(drop=True, inplace=True)
     if set(bundle.fit_in_sample["date"]) != set(dates):
         raise ValueError("In-sample fit dates do not match the full fitted data.")
+    if not bundle.fit_oos.empty:
+        holdout = bundle.fit_oos["date"]
+        metadata = m.get("oos", {})
+        cutoff = pd.to_datetime(metadata.get("training_end"))
+        if cutoff is None or pd.isna(cutoff) or cutoff >= holdout.min():
+            raise ValueError("OOS results require a training cutoff before the holdout.")
+        if not holdout.diff().dropna().eq(pd.Timedelta(days=7)).all():
+            raise ValueError("OOS dates must be consecutive weeks.")
+        if metadata.get("weeks", len(holdout)) != len(holdout):
+            raise ValueError("OOS week count disagrees with the manifest.")
     c = bundle.contributions
     if not {"date", "effect", "group", "mean"}.issubset(c):
         raise ValueError("Invalid contribution table.")
@@ -144,10 +189,21 @@ def validate_bundle(bundle):
     expected_effects = set(channels + controls + ["Intercept", "Seasonality"])
     if not expected_effects.issubset(set(c["effect"])):
         raise ValueError("Contributions are missing one or more model components.")
+    if set(c["effect"]) != expected_effects:
+        raise ValueError("Contributions contain unexpected model components.")
     if set(c["date"]) != set(dates) or any(
         not expected_effects.issubset(set(rows["effect"])) for _, rows in c.groupby("date")
     ):
         raise ValueError("Each fitted week must include all model components.")
+    expected_groups = {**{name: "Marketing" for name in channels},
+                       **{name: "Context" for name in controls},
+                       "Intercept": "Intercept", "Seasonality": "Seasonality"}
+    if not c["group"].eq(c["effect"].map(expected_groups)).all():
+        raise ValueError("Contribution groups disagree with the modeled components.")
+    fitted = bundle.fit_in_sample.set_index("date")["predicted"]
+    reconstructed = c.groupby("date")["mean"].sum().reindex(fitted.index)
+    if not np.allclose(reconstructed, fitted, rtol=1e-5, atol=1e-5):
+        raise ValueError("Exported contributions do not reconstruct the fitted mean.")
 
 
 def fit_metrics(frame):
@@ -193,27 +249,25 @@ def make_demo_bundle():
     """Deterministic synthetic example, visibly distinct from client results."""
     from scipy.special import expit
     rng = np.random.default_rng(42)
-    channels = ["meta_conversion_spend", "meta_engagement_spend", "meta_traffic_spend",
-        "meta_thruplay_spend", "meta_other_spend", "google_search_spend",
-        "google_pmax_spend", "google_display_spend"]
-    labels = dict(zip(channels, ["Meta Conversion", "Meta Engagement", "Meta Traffic",
-        "Meta ThruPlay", "Meta Other", "Google Search", "Google PMax", "Google Display"]))
+    channels = CURRENT_CHANNELS.copy()
+    labels = CURRENT_CHANNEL_LABELS.copy()
+    C = len(channels)
     controls = ["discount_rate_scaled", "linear_trend_scaled"]
     T, S, L = 156, 600, 8
     dates = pd.date_range("2023-10-02", periods=T, freq="7D")
     t = np.arange(T)
-    multipliers = np.array([110000, 5500, 3000, 2300, 1000, 14000, 24000, 9000])
+    multipliers = np.array([110000, 5500, 3000, 14000, 24000, 9000, 3500, 4500, 2800])
     spend = multipliers * np.maximum(.2, 1 + .28*np.sin(2*np.pi*t[:,None]/52)
-        + rng.normal(0,.14,(T,8)) + .12*t[:,None]/T)
-    spend[:35,2:5] = 0
-    spend[-12:,4] = 0
-    spend[45:58,3] = 0
+        + rng.normal(0,.14,(T,C)) + .12*t[:,None]/T)
+    spend[:35,6:] = 0
+    spend[-12:,8] = 0
+    spend[45:58,5] = 0
     scales = spend.max(axis=0)
     target_scale = 700.
-    alpha = np.clip(rng.normal([.35,.45,.25,.55,.30,.015,.30,.40], .025, (S,8)), .001,.9)
-    beta = np.maximum(.001, rng.normal([.33,.028,.035,.025,.014,.11,.08,.045], .006,(S,8)))
-    kappa = np.exp(rng.normal(np.log(.6),.06,(S,8)))
-    slope = np.exp(rng.normal(np.log(1.2),.05,(S,8)))
+    alpha = np.clip(rng.normal([.35,.45,.25,.015,.30,.40,.55,.25,.45], .025, (S,C)), .001,.9)
+    beta = np.maximum(.001, rng.normal([.33,.028,.035,.11,.08,.045,.025,.035,.02], .006,(S,C)))
+    kappa = np.exp(rng.normal(np.log(.6),.06,(S,C)))
+    slope = np.exp(rng.normal(np.log(1.2),.05,(S,C)))
     intercept = rng.normal(.18,.008,S)
     gamma_control = rng.normal([.06,.055],[.004,.004],(S,2))
     gamma_fourier = rng.normal([.018,-.005,.025,.007], .003,(S,4))
@@ -223,7 +277,7 @@ def make_demo_bundle():
     control_data = np.column_stack([discount/.1,t/(T-1)])
     weights = alpha[:,:,None] ** np.arange(L)
     weights /= weights.sum(axis=2,keepdims=True)
-    media = np.zeros((S,T,8))
+    media = np.zeros((S,T,C))
     for i in range(T):
         A = sum(weights[:,:,lag]*spend[i-lag]/scales for lag in range(min(L,i+1)))
         safe = np.where(A>0,A,1.)
@@ -270,10 +324,17 @@ def make_demo_bundle():
         "control_scaling":{"discount_unit":.1,"trend_origin":str(dates[0].date()),"trend_span_days":(T-1)*7},
         "currency":"","fit_interval_level":.9,"fit_intervals_type":"expected_mean",
         "diagnostics":{},
+        "oos":{"status":"available", "weeks":12,
+               "training_end":str(dates[-13].date()),
+               "intervals_type":"posterior_predictive",
+               "evaluation_type":"synthetic_illustration"},
         "training_start":str(dates[0].date()),"training_end":str(dates[-1].date())}
     posterior={"alpha":alpha,"beta":beta,"kappa":kappa,"slope":slope,"channel_scale":scales,
         "target_scale":np.asarray(target_scale),"intercept":intercept,"gamma_control":gamma_control,
-        "gamma_fourier":gamma_fourier,"noise_sigma":noise}
-    bundle=ModelBundle(manifest,weekly,posterior,in_fit,oos_fit,pd.DataFrame(rows),pd.DataFrame(),"synthetic-demo-v1")
+        "gamma_fourier":gamma_fourier,"noise_sigma":noise,
+        "fitted_last_channel_contribution":media[:,-1,:]/target_scale,
+        "fitted_last_mu":mu[:,-1]/target_scale}
+    bundle=ModelBundle(manifest,weekly,posterior,in_fit,oos_fit,pd.DataFrame(rows),pd.DataFrame(),"synthetic-demo-nine-channel-v2")
     validate_bundle(bundle)
     return bundle
+
